@@ -7,6 +7,7 @@ import { PufferVaultV2 } from "../src/PufferVaultV2.sol";
 import { PufferVaultV3 } from "../src/PufferVaultV3.sol";
 import { PufferVaultV4 } from "../src/PufferVaultV4.sol";
 import { PufferVaultV2Tests } from "../test/mocks/PufferVaultV2Tests.sol";
+import { PufferVaultV3Tests } from "../test/mocks/PufferVaultV3Tests.sol";
 import { PufferVaultV4Tests } from "../test/mocks/PufferVaultV4Tests.sol";
 import { PufferDepositorV2 } from "../src/PufferDepositorV2.sol";
 import { MockPufferOracle } from "./mocks/MockPufferOracle.sol";
@@ -62,6 +63,8 @@ contract MainnetForkTestHelper is Test, DeployerHelper {
     PufferVaultV2 public pufferVaultNonBlocking;
     AccessManager public accessManager;
     Timelock public timelock;
+    uint256 public maxGrantAmount = 1 ether;
+    uint256 public grantEpochDuration = 30 days;
 
     // Lido contract (stETH)
     IStETH stETH = IStETH(0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84);
@@ -223,7 +226,29 @@ contract MainnetForkTestHelper is Test, DeployerHelper {
         vm.stopPrank();
     }
 
-    function _upgradeToMainnetV4Puffer() internal {
+    function _upgradeToMainnetV3Puffer(uint256 grantEpochStartTime) internal {
+        pufferVaultNonBlocking = new PufferVaultV3Tests({
+            stETH: IStETH(_getStETH()),
+            weth: IWETH(_getWETH()),
+            lidoWithdrawalQueue: ILidoWithdrawalQueue(_getLidoWithdrawalQueue()),
+            stETHStrategy: IStrategy(_getStETHStrategy()),
+            eigenStrategyManager: IEigenLayer(_getEigenLayerStrategyManager()),
+            oracle: IPufferOracle(_getPufferOracle()),
+            delegationManager: IDelegationManager(_getEigenDelegationManager()),
+            maxGrantAmount: maxGrantAmount,
+            grantEpochStartTime: grantEpochStartTime,
+            grantEpochDuration: grantEpochDuration
+        });
+
+        PufferVaultV3 newImplementation = PufferVaultV3(payable(address(pufferVaultNonBlocking)));
+
+        vm.prank(COMMUNITY_MULTISIG);
+        vm.expectEmit();
+        emit ERC1967Utils.Upgraded(address(newImplementation));
+        UUPSUpgradeable(pufferVault).upgradeToAndCall(address(newImplementation), "");
+    }
+
+    function _upgradeToMainnetV4Puffer(uint256 grantEpochStartTime) internal {
         pufferVaultNonBlocking = new PufferVaultV4Tests({
             stETH: IStETH(_getStETH()),
             weth: IWETH(_getWETH()),
@@ -232,7 +257,10 @@ contract MainnetForkTestHelper is Test, DeployerHelper {
             eigenStrategyManager: IEigenLayer(_getEigenLayerStrategyManager()),
             oracle: IPufferOracle(_getPufferOracle()),
             delegationManager: IDelegationManager(_getEigenDelegationManager()),
-            revenueDepositor: IPufferRevenueDepositor(address(0))
+            revenueDepositor: IPufferRevenueDepositor(address(0)),
+            maxGrantAmount: maxGrantAmount,
+            grantEpochStartTime: grantEpochStartTime,
+            grantEpochDuration: grantEpochDuration
         });
 
         // Simulate that our deployed oracle becomes active and starts posting results of Puffer staking

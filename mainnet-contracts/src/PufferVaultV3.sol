@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity >=0.8.0 <0.9.0;
 
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { Address } from "@openzeppelin/contracts/utils/Address.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import { MerkleProof } from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import { PufferVaultV2 } from "./PufferVaultV2.sol";
 import { IStETH } from "./interface/Lido/IStETH.sol";
 import { ILidoWithdrawalQueue } from "./interface/Lido/ILidoWithdrawalQueue.sol";
@@ -10,7 +14,6 @@ import { IDelegationManager } from "./interface/EigenLayer/IDelegationManager.so
 import { IWETH } from "./interface/Other/IWETH.sol";
 import { IPufferVaultV3 } from "./interface/IPufferVaultV3.sol";
 import { IPufferOracle } from "./interface/IPufferOracle.sol";
-import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title PufferVaultV3
@@ -19,7 +22,27 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
  * @custom:security-contact security@puffer.fi
  */
 contract PufferVaultV3 is PufferVaultV2, IPufferVaultV3 {
+    using SafeERC20 for IWETH;
+    using Address for address payable;
     using Math for uint256;
+
+    /**
+     * @dev Maximum grant amount
+     * @custom:oz-upgrades-unsafe-allow state-variable-immutable
+     */
+    uint256 internal immutable _MAX_GRANT_AMOUNT;
+
+    /**
+     * @dev Grant epoch start time (in seconds)
+     * @custom:oz-upgrades-unsafe-allow state-variable-immutable
+     */
+    uint256 internal immutable _GRANT_EPOCH_START_TIME;
+
+    /**
+     * @dev Grant epoch duration (in seconds)
+     * @custom:oz-upgrades-unsafe-allow state-variable-immutable
+     */
+    uint256 internal immutable _GRANT_EPOCH_DURATION;
 
     /**
      * @notice Initializes the PufferVaultV3 contract.
@@ -30,6 +53,9 @@ contract PufferVaultV3 is PufferVaultV2, IPufferVaultV3 {
      * @param eigenStrategyManager Address of the EigenLayer strategy manager contract.
      * @param oracle Address of the PufferOracle contract.
      * @param delegationManager Address of the delegation manager contract.
+     * @param maxGrantAmount Maximum grant amount
+     * @param grantEpochStartTime Grant epoch start time (in seconds)
+     * @param grantEpochDuration Grant epoch duration (in seconds)
      * @custom:oz-upgrades-unsafe-allow constructor
      */
     constructor(
@@ -39,8 +65,15 @@ contract PufferVaultV3 is PufferVaultV2, IPufferVaultV3 {
         IStrategy stETHStrategy,
         IEigenLayer eigenStrategyManager,
         IPufferOracle oracle,
-        IDelegationManager delegationManager
+        IDelegationManager delegationManager,
+        uint256 maxGrantAmount,
+        uint256 grantEpochStartTime,
+        uint256 grantEpochDuration
     ) PufferVaultV2(stETH, weth, lidoWithdrawalQueue, stETHStrategy, eigenStrategyManager, oracle, delegationManager) {
+        _MAX_GRANT_AMOUNT = maxGrantAmount;
+        _GRANT_EPOCH_START_TIME = grantEpochStartTime;
+        _GRANT_EPOCH_DURATION = grantEpochDuration;
+
         _disableInitializers();
     }
 
@@ -126,5 +159,68 @@ contract PufferVaultV3 is PufferVaultV2, IPufferVaultV3 {
 
         // msg.sender is the L1RewardManager contract
         _burn(msg.sender, pufETHAmount);
+    }
+
+    /**
+     * @notice Set the grant Merkle root for the grantee list.
+     */
+    function setGrantRoot(bytes32 grantRoot) external restricted {
+        VaultStorage storage $ = _getPufferVaultStorage();
+        $.grantRoot = grantRoot;
+        emit GrantRootSet(grantRoot);
+    }
+
+    /**
+     * @notice Claims a certain amount of grant in either the native or WETH token.
+     * In order to make a claim, the caller should provide a Merkle proof of being
+     * a part of the grantee list.
+     */
+    function claimGrant(uint256 amount, bool isNativePayment, bytes32[] calldata proof) external {
+        VaultStorage storage $ = _getPufferVaultStorage();
+        if (amount == 0 || amount > _MAX_GRANT_AMOUNT) {
+            revert InvalidGrantAmount(amount);
+        }
+
+        address grantee = msg.sender;
+        bytes32 data = keccak256(abi.encodePacked(grantee));
+        if (!MerkleProof.verify(proof, $.grantRoot, data)) {
+            revert IneligibleGrantee(grantee);
+        }
+
+        (uint256 epoch, uint256 claimableAmount) = getClaimableGrant(grantee);
+        if (amount > claimableAmount) {
+            revert UnavailableGrantAmount(amount, claimableAmount);
+        }
+
+        $.granteeEpochAmounts[grantee][epoch] += amount;
+        emit GrantPaid(grantee, epoch, amount, isNativePayment);
+
+        isNativePayment ? payable(grantee).sendValue(amount) : IWETH(_WETH).safeTransfer(grantee, amount);
+    }
+
+    /**
+     * @notice Returns all the grant information: the grant root, the maximum grant 
+     * amount, the grant epoch start time, the grant epoch duration.
+     */
+    function getGrantInfo() external view returns (bytes32, uint256, uint256, uint256) {
+        VaultStorage storage $ = _getPufferVaultStorage();
+        return ($.grantRoot, _MAX_GRANT_AMOUNT, _GRANT_EPOCH_START_TIME, _GRANT_EPOCH_DURATION);
+    }
+
+    /**
+     * @notice Return the claimable grant information: the current grant epoch and available
+     * grant amount.
+     */
+    function getClaimableGrant(address grantee) public view returns (uint256 epoch, uint256 amount) {
+        VaultStorage storage $ = _getPufferVaultStorage();
+        epoch = calculateGrantEpoch();
+        amount = _MAX_GRANT_AMOUNT - $.granteeEpochAmounts[grantee][epoch];
+    }
+
+    /**
+     * @notice Calculates the current grant epoch.
+     */
+    function calculateGrantEpoch() public view returns (uint256) {
+        return (block.timestamp - _GRANT_EPOCH_START_TIME) / _GRANT_EPOCH_DURATION;
     }
 }
